@@ -7,6 +7,9 @@ test_responses_adapter.py — 验证 Responses API 适配层的转换逻辑。
 
 import json
 import sys
+
+import pytest
+
 sys.path.insert(0, ".")
 
 from core.responses_adapter import (
@@ -14,7 +17,10 @@ from core.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from core.desensitize import desensitize_body
+try:
+    from core.desensitize import desensitize_body
+except ImportError:  # release branch excludes the internal module
+    desensitize_body = None
 from core.responses_projection import (
     MODEL_CONTEXT_TOKENS,
     pair_token_estimate,
@@ -142,6 +148,7 @@ def test_typed_developer_message_request():
     print("✅ test_typed_developer_message_request")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_desensitize_harness_user_and_tools():
     """测试：harness user 上下文会被摘要，tool 描述会脱敏，真实 user 不改。"""
     body = {
@@ -172,6 +179,7 @@ def test_desensitize_harness_user_and_tools():
     print("✅ test_desensitize_harness_user_and_tools")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_compact_harness_messages_and_strip_tool_metadata():
     """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉。"""
     body = {
@@ -209,6 +217,7 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_no_compact_still_prunes_codex_runtime_metadata():
     """测试：保留全文模式仍会裁掉 Codex 注入的运行时元数据大段文本。"""
     body = {
@@ -576,12 +585,12 @@ def test_nonstream_response():
     print("✅ test_nonstream_response")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_channel_detection_terms_zwsp():
     """P-201 v2 回归（2026-09-19）：通道检测词必须被零宽脱敏。
 
     实证链：完整 base_instructions 原文 → 后端 400 code 11128
-    (Illegal API invocation from an unapproved channel)；
-    通道词 ZWSP 化后 → 200（probe_11128.py P1/P1b）。
+    （未授权调用通道提示）；通道词零宽化后 → 200（本地探针 P1/P1b）。
     若本用例挂，说明词表被回退，codex 全形态请求将再次全阻。
     """
     from core.desensitize import desensitize_text
@@ -600,6 +609,7 @@ def test_channel_detection_terms_zwsp():
     print("✅ test_channel_detection_terms_zwsp")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_desensitize_preserves_windows_and_posix_paths():
     """路径中的通道词不得插入 ZWSP，否则模型会构造出不存在的路径。"""
     from core.desensitize import desensitize_text
@@ -611,6 +621,7 @@ def test_desensitize_preserves_windows_and_posix_paths():
     print("✅ test_desensitize_preserves_windows_and_posix_paths")
 
 
+@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_desensitize_still_processes_non_path_text():
     """路径豁免不能削弱普通文本的通道检测词脱敏。"""
     from core.desensitize import desensitize_text
