@@ -1008,6 +1008,47 @@ def test_namespace_tools_flattened_and_restored():
     print("✅ test_namespace_tools_flattened_and_restored")
 
 
+def test_namespace_bare_subtool_name_restored():
+    """#18 / G-11：唯一裸子工具名必须还原 namespace，不能原样转发。"""
+    conv = ResponsesStreamConverter(
+        model="glm-5.3",
+        namespace_tool_names={"collaboration__spawn_agent": "spawn_agent"},
+    )
+    conv.feed_line(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        '"function":{"name":"spawn_agent","arguments":"{}"}}]}}]}'
+    )
+    conv.finish()
+    resp = conv.get_nonstream_response()
+    call = next(i for i in resp["output"] if i["type"] == "function_call")
+    assert call["name"] == "spawn_agent"
+    assert call["namespace"] == "collaboration"
+    assert conv.namespace_fallback_hits == {"spawn_agent": 4}
+    print("✅ test_namespace_bare_subtool_name_restored")
+
+
+def test_namespace_bare_subtool_conflict_not_restored():
+    """#18 / G-11：同名裸子工具跨 namespace 冲突时禁止猜测，保持原样转发。"""
+    conv = ResponsesStreamConverter(
+        model="glm-5.3",
+        namespace_tool_names={
+            "collaboration__list_agents": "list_agents",
+            "mcp__node_repl__list_agents": "list_agents",
+        },
+    )
+    conv.feed_line(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        '"function":{"name":"list_agents","arguments":"{}"}}]}}]}'
+    )
+    conv.finish()
+    resp = conv.get_nonstream_response()
+    call = next(i for i in resp["output"] if i["type"] == "function_call")
+    assert call["name"] == "list_agents"
+    assert "namespace" not in call
+    assert conv.namespace_fallback_hits == {}
+    print("✅ test_namespace_bare_subtool_conflict_not_restored")
+
+
 # ---------------------------------------------------------------------------
 # 补丁 #16（2026-09-21，docs/29 / docs/25 G-09·R1 补充条款）：工具输出形态归一化
 #
@@ -1260,3 +1301,148 @@ def test_user_content_untyped_part_degradation_is_logged():
     assert "unsupported" in content[0]["text"]
     assert norm[0]["degraded"] == ["<missing>"]
     print("✅ test_user_content_untyped_part_degradation_is_logged")
+
+
+# ---------------------------------------------------------------------------
+# 补丁 #19：动态拉取官方模型列表（/v2/enterprises/personal/models + 1h TTL）
+# ---------------------------------------------------------------------------
+
+import core.converter as _conv
+
+
+def _reset_official_cache():
+    _conv._official_models_cache["list"] = None
+    _conv._official_models_cache["ts"] = 0.0
+
+
+def test_extract_official_models_prefers_default_tag():
+    """带 default 标签的 agent 的 models 是权威列表。"""
+    payload = {"data": {"agents": [
+        {"models": ["other-1", "other-2"], "tags": []},
+        {"models": ["glm-9", "kimi-k9"], "tags": ["default"]},
+    ]}}
+    assert _conv._extract_official_models(payload) == ["glm-9", "kimi-k9"]
+    print("✅ test_extract_official_models_prefers_default_tag")
+
+
+def test_extract_official_models_union_excludes_lite():
+    """无 default 标签时退化为并集，且剔除内部 lite 模型、去重保序。"""
+    payload = {"data": {"agents": [
+        {"models": ["a", "lite", "b"], "tags": []},
+        {"models": ["b", "c", "lite"], "tags": []},
+    ]}}
+    assert _conv._extract_official_models(payload) == ["a", "b", "c"]
+    # 空 / 缺字段输入必须安全返回空列表
+    assert _conv._extract_official_models({}) == []
+    assert _conv._extract_official_models({"data": {}}) == []
+    print("✅ test_extract_official_models_union_excludes_lite")
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self.status_code = status
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _patch_fetch(monkeypatch, payload=None, status=200, raise_exc=None, calls=None):
+    """替换 _cred 与 httpx.Client，返回可控的官方模型响应。"""
+    class _Cred:
+        def get_headers(self):
+            return {"Authorization": "Bearer x"}
+
+    monkeypatch.setattr(_conv, "_cred", lambda: _Cred())
+
+    class _Client:
+        def __init__(self, timeout=0):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, headers=None):
+            if calls is not None:
+                calls.append(url)
+            if raise_exc is not None:
+                raise raise_exc
+            return _FakeResp(payload or {"data": {"agents": []}}, status)
+
+    monkeypatch.setattr(_conv.httpx, "Client", _Client)
+
+
+def test_official_models_take_priority_over_static(monkeypatch):
+    """官方动态列表命中时是 /v1/models 的最高权威来源，且仍合并 EXTRA_MODELS。"""
+    _reset_official_cache()
+    payload = {"data": {"agents": [
+        {"models": ["glm-9", "kimi-k9"], "tags": ["default"]},
+    ]}}
+    _patch_fetch(monkeypatch, payload)
+    # 即便 product.json 有别的模型，官方列表也必须优先
+    monkeypatch.setattr(_conv, "_load_models_from_workbuddy", lambda: ["wb-static"])
+
+    models = _conv.get_available_models()
+    assert models[:2] == ["glm-9", "kimi-k9"], models
+    assert "wb-static" not in models
+    # EXTRA_MODELS 仍合并（补丁 #2 语义不回归）
+    for m in _conv.EXTRA_MODELS:
+        assert m in models
+    _reset_official_cache()
+    print("✅ test_official_models_take_priority_over_static")
+
+
+def test_official_models_failure_falls_back_to_static(monkeypatch):
+    """上游 5xx / 网络异常 / 凭据缺失时静默回退静态链，绝不抛错影响路由。"""
+    _reset_official_cache()
+    monkeypatch.setattr(_conv, "_load_models_from_workbuddy", lambda: ["wb-static"])
+
+    # 情形1：HTTP 非 200
+    _patch_fetch(monkeypatch, status=500)
+    models = _conv.get_available_models()
+    assert "wb-static" in models
+
+    # 情形2：网络异常
+    _reset_official_cache()
+    _patch_fetch(monkeypatch, raise_exc=RuntimeError("boom"))
+    models = _conv.get_available_models()
+    assert "wb-static" in models
+
+    # 情形3：凭据缺失（_cred 抛 HTTPException 503）
+    from fastapi import HTTPException
+    _reset_official_cache()
+    def _no_cred():
+        raise HTTPException(status_code=503, detail="no cred")
+    monkeypatch.setattr(_conv, "_cred", _no_cred)
+    monkeypatch.setattr(_conv.httpx, "Client", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不应发起网络请求")))
+    models = _conv.get_available_models()
+    assert "wb-static" in models
+
+    _reset_official_cache()
+    print("✅ test_official_models_failure_falls_back_to_static")
+
+
+def test_official_models_ttl_cache_avoids_refetch(monkeypatch):
+    """TTL 内重复调用命中缓存，不重复请求上游（resolve_model 每请求调用的安全闸）。"""
+    _reset_official_cache()
+    payload = {"data": {"agents": [
+        {"models": ["glm-9"], "tags": ["default"]},
+    ]}}
+    calls = []
+    _patch_fetch(monkeypatch, payload, calls=calls)
+
+    m1 = _conv._fetch_official_models()
+    m2 = _conv._fetch_official_models()
+    m3 = _conv._fetch_official_models()
+    assert m1 == ["glm-9"] and m2 == m1 and m3 == m1
+    assert len(calls) == 1, f"TTL 内应只请求一次，实际 {len(calls)}"
+
+    # force=True 必须绕过缓存重新拉取
+    m4 = _conv._fetch_official_models(force=True)
+    assert len(calls) == 2
+    assert m4 == m1
+    _reset_official_cache()
+    print("✅ test_official_models_ttl_cache_avoids_refetch")
