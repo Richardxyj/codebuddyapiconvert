@@ -543,6 +543,19 @@ class ResponsesStreamConverter:
         # Codex 发送 namespace tools，但 Chat 后端只见展平后的别名。模型回呼
         # 别名时需拆回 name=<子工具名> + namespace=<namespace> 两字段。
         self._namespace_tool_names: dict[str, str] = dict(namespace_tool_names or {})
+        # 补丁 #18（2026-09-22，docs/30 / docs/25 G-11）：模型有时会照抄系统提示
+        # 里的裸子工具名（如 spawn_agent）。裸名在所有 namespace 中唯一时按该
+        # namespace 还原；冲突时保持原样转发，禁止猜测目标 namespace。
+        self._namespace_fallbacks: dict[str, str] = {}
+        namespaces_by_subtool: dict[str, set[str]] = {}
+        for alias, subtool_name in self._namespace_tool_names.items():
+            namespace = alias.rsplit("__", 1)[0]
+            namespaces_by_subtool.setdefault(subtool_name, set()).add(namespace)
+        self._namespace_fallbacks = {
+            subtool_name: next(iter(namespaces))
+            for subtool_name, namespaces in namespaces_by_subtool.items()
+            if len(namespaces) == 1
+        }
 
         # 状态标记
         self._emitted_created = False
@@ -558,6 +571,8 @@ class ResponsesStreamConverter:
         # 累积内容
         self._content = ""
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
+        # 补丁 #18 观测：记录被裸名兜底还原的调用次数，由 converter 层统一落日志。
+        self.namespace_fallback_hits: dict[str, int] = {}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
 
@@ -846,6 +861,12 @@ class ResponsesStreamConverter:
         if subtool_name:
             item["name"] = subtool_name
             item["namespace"] = tc["name"].rsplit("__", 1)[0]
+            return item
+        namespace = self._namespace_fallbacks.get(tc["name"])
+        if namespace:
+            item["namespace"] = namespace
+            hits = self.namespace_fallback_hits.get(tc["name"], 0)
+            self.namespace_fallback_hits[tc["name"]] = hits + 1
         return item
 
     def _is_custom_tool(self, name: str) -> bool:

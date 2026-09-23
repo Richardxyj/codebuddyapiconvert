@@ -375,24 +375,93 @@ def _load_models_from_workbuddy() -> list[str]:
 EXTRA_MODELS = ["glm-5.3", "kimi-k2.8-preview"]
 
 
+# 本地补丁 #19（2026-09-22）：动态拉取官方模型列表（对标 freeworkbuddy webbuddy/models.py）。
+# 上游官方上新模型后自动跟进，无需再手改 EXTRA_MODELS + 模型目录 + 常量三处。
+# 端点 /v2/enterprises/personal/models 返回该账号当下真正可用的 agent 模型集，
+# 比本机 WorkBuddy product.json（静态落盘、随安装包版本冻结）更权威、更新更快。
+OFFICIAL_MODELS_PATH = "/v2/enterprises/personal/models"
+OFFICIAL_MODELS_TTL = 3600  # 秒；resolve_model() 每请求调用 get_available_models()，必须 TTL 缓存避免打爆上游
+
+_official_models_cache: dict = {"list": None, "ts": 0.0}
+_official_models_lock = threading.Lock()
+
+
+def _extract_official_models(payload: dict) -> list[str]:
+    """从官方模型接口响应提取用户可用模型 ID。
+
+    优先取带 default 标签的 agent 的 models；缺失时退化为全部 agent
+    模型的并集（剔除内部子代理用的 lite）。
+    """
+    agents = (payload.get("data") or {}).get("agents") or []
+    for agent in agents:
+        models = agent.get("models") or []
+        tags = agent.get("tags") or []
+        if models and "default" in tags:
+            return list(dict.fromkeys(models))
+    union: list[str] = []
+    for agent in agents:
+        for m in agent.get("models") or []:
+            if m != "lite" and m not in union:
+                union.append(m)
+    return union
+
+
+def _fetch_official_models(force: bool = False) -> list | None:
+    """拉取官方模型列表（带 TTL 缓存）；失败时返回过期缓存或 None。
+
+    任何异常（网络 / 凭据缺失 / 解析失败）都静默降级，返回 None 让调用方
+    回退到静态列表——绝不影响请求路由。
+    """
+    now = time.time()
+    with _official_models_lock:
+        cached = _official_models_cache["list"]
+        fresh = cached is not None and now - _official_models_cache["ts"] < OFFICIAL_MODELS_TTL
+    if not force and fresh:
+        return cached
+    try:
+        headers = _cred().get_headers()
+    except Exception:
+        # 未登录 / 凭据不可用：无法鉴权上游，直接走缓存或静态兜底
+        return cached
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(f"{BACKEND}{OFFICIAL_MODELS_PATH}", headers=headers)
+        if resp.status_code != 200:
+            return cached
+        models = _extract_official_models(resp.json())
+        if not models:
+            return cached
+        with _official_models_lock:
+            _official_models_cache["list"] = models
+            _official_models_cache["ts"] = time.time()
+        return models
+    except Exception:
+        return cached
+
+
 def get_available_models() -> list[str]:
     """
     获取可用的模型列表。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
+    优先级：官方动态列表（/v2/enterprises/personal/models，1h TTL）
+    > WorkBuddy product.json > DEFAULT_MODELS 硬编码。
     无论来源，都会合并 EXTRA_MODELS（本地补丁）。
 
     Returns:
         模型 ID 列表
     """
-    workbuddy_models = _load_models_from_workbuddy()
-
-    if workbuddy_models:
-        # 成功从 WorkBuddy 加载，使用动态列表
-        base = workbuddy_models
+    official = _fetch_official_models()
+    if official:
+        # 官方动态列表是最高权威来源
+        base = official
     else:
-        # 降级到硬编码列表
-        base = DEFAULT_MODELS
+        workbuddy_models = _load_models_from_workbuddy()
+        if workbuddy_models:
+            # 成功从 WorkBuddy 加载，使用动态列表
+            base = workbuddy_models
+        else:
+            # 降级到硬编码列表
+            base = DEFAULT_MODELS
 
     merged = list(base)
     for m in EXTRA_MODELS:
@@ -513,6 +582,18 @@ def _log(msg: str):
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+def _log_namespace_fallbacks(rid: str, hits: dict[str, int], flow: str) -> None:
+    """补丁 #18（docs/25 G-11）：裸名 namespace 还原必须留下 R2 观测。"""
+    if not hits:
+        return
+    details = ", ".join(f"{name}×{count}" for name, count in sorted(hits.items()))
+    prefix = f"[{rid}] " if rid else ""
+    _log(
+        f"{prefix}── RESPONSES FC NS FALLBACK ── flow={flow} | count={sum(hits.values())} "
+        f"| {details} | reason=unambiguous-bare-subtool-name | reversible=yes"
+    )
 
 
 def _log_body_dump(tag: str, body: dict) -> None:
@@ -1340,6 +1421,7 @@ async def create_response(
     result = converter.get_nonstream_response()
     elapsed = time.time() - t0
     _log(f"[{rid}] ◀ RESPONSES {model_name} | {elapsed:.1f}s")
+    _log_namespace_fallbacks(rid, converter.namespace_fallback_hits, "nonstream")
     _log(
         f"[{rid}] ── RESPONSE OBJ ──\n{json.dumps(result, ensure_ascii=False, indent=2)}"
     )
@@ -1448,6 +1530,7 @@ async def _stream_responses(
 
     elapsed = time.time() - t0 if t0 else 0
     _log(f"{prefix}◀ RESPONSES {model_name} | {elapsed:.1f}s | stream done")
+    _log_namespace_fallbacks(rid, converter.namespace_fallback_hits, "stream")
     _log(f"{prefix}── RESPONSES RAW SSE ──\n" + "\n".join(raw_sse_lines))
 
 
