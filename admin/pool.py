@@ -2,6 +2,7 @@
 import asyncio
 import json
 import math
+import re
 import threading
 import time
 from contextvars import ContextVar
@@ -15,6 +16,58 @@ from fastapi.responses import JSONResponse
 REQUEST_CREDENTIAL = ContextVar("pool_credential", default=None)
 CN = timezone(timedelta(hours=8))
 BILLING = "https://www.codebuddy.cn/v2/billing/meter/"
+
+
+def _pool_log(msg: str):
+    """把池事件写进 converter.log（复用 converter 的日志通道；失败静默——日志绝不能打断请求）。"""
+    try:
+        from core import converter
+        converter._log(msg)
+    except Exception:
+        pass
+
+
+_RESET_DATETIME = re.compile(
+    r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})[日T\s]*(\d{1,2}):(\d{2})(?::(\d{2}))?"
+)
+# (?<![\d.])：拒绝小数（"1.5小时"不得截断成"5小时"，对抗审计 P2-5）
+_RESET_RELATIVE = re.compile(r"(?<![\d.])(\d+)\s*(秒|分钟|个小时|小时|天)")
+# 解析结果边界（对抗审计 P1-1：相对与绝对同限，防"30天"月配额文案把唯一账号冷一月）
+_RETRY_AT_MAX_AHEAD = 7 * 86400
+
+
+def parse_retry_at(text, now):
+    """从上游 429/402 错误文本解析重置时刻（epoch 秒）；解析不到返回 None（调用方兜底，不编造）。
+
+    语义与 dsh-connect-workbuddy 的"不编造倒计时"对齐（docs/35 §2.2）：
+    - 绝对时间（如"将在 2026-10-15 14:30:00 重置"）按 CN 时区（UTC+8）解释；
+    - 相对时间（"N 分钟/小时/天后"）按当前时钟换算；小数（"1.5小时"）不截断、返回 None；
+    - 解析结果在过去或超过 7 天视为不可信，返回 None（远期多为解析伪影/月配额文案）。
+    """
+    if not text:
+        return None
+    ts = None
+    m = _RESET_DATETIME.search(str(text))
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), int(m.group(6) or 0), tzinfo=CN)
+            ts = dt.timestamp()
+        except ValueError:
+            return None
+    else:
+        m = _RESET_RELATIVE.search(str(text))
+        if not m:
+            return None
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            return None
+        unit = {"秒": 1, "分钟": 60, "小时": 3600, "个小时": 3600, "天": 86400}[m.group(2)]
+        ts = now + n * unit
+    if now < ts <= now + _RETRY_AT_MAX_AHEAD:
+        return ts
+    return None
 
 
 def number(value):
@@ -115,7 +168,13 @@ class AccountPool:
             item = self.store.data["accounts"][aid]
             return aid, self.store.manager_for(aid, item)
 
-    def record(self, aid, status=200):
+    def states_summary(self):
+        """池内各账号一行摘要，供 503/异常日志使用（R2：拒绝零日志降级）。全程持锁（对抗审计 P3-11）。"""
+        with self.store.lock:
+            rows = self.store.account_rows()
+            return ", ".join(f"{row.get('name') or row['id']}:{self.state(row)}" for row in rows) or "(无账号)"
+
+    def record(self, aid, status=200, retry_at=None):
         with self.store.lock:
             if aid not in self.store.data["accounts"]:
                 return
@@ -125,7 +184,16 @@ class AccountPool:
             if status in (401, 403):
                 data.update(cooldown_until=self.clock() + 300, last_error="上游认证或访问被拒绝，已冷却 5 分钟")
             elif status in (402, 429):
-                data.update(cooldown_until=self.clock() + 1800, last_error="上游额度或频率限制，已冷却 30 分钟")
+                # 上游声明的重置时刻优先（P1a：解析响应体，不编造倒计时）；
+                # 解析不到才用 30 分钟兜底。文案区分两种来源并带恢复时刻（对抗审计 P2-6 深化）。
+                if retry_at is not None and retry_at > self.clock():
+                    until = retry_at
+                    resume = datetime.fromtimestamp(retry_at, CN).strftime("%m-%d %H:%M")
+                    message = f"上游额度或频率限制，已按上游声明重置时间冷却至 {resume}"
+                else:
+                    until = self.clock() + 1800
+                    message = "上游额度或频率限制，上游未声明重置时间，默认冷却 30 分钟"
+                data.update(cooldown_until=until, last_error=message)
             self.store.save()
 
     def billing(self, client, headers, path, body=None):
@@ -284,14 +352,19 @@ class PoolMiddleware:
                 aid, manager = self.pool.select()
                 await asyncio.to_thread(manager.get_headers)
         except HTTPException as e:
+            # P0（docs/35 §3）：池空/无可用账号 503 必须留结构化日志——09-30 事故根因就是零日志。
+            _pool_log(f"✗ POOL {e.status_code} {scope.get('path')}：{e.detail} | 账号状态: {self.pool.states_summary()}")
             return await JSONResponse({"detail": e.detail}, e.status_code)(scope, receive, send)
         except Exception:
+            # 广义失败（凭据准备崩溃等）同样不能零日志
+            _pool_log(f"✗ POOL 500 {scope.get('path')}：账号凭据异常 | 账号状态: {self.pool.states_summary()}")
             return await JSONResponse({"detail": "账号凭据暂不可用，请刷新凭据或重新授权"}, 503)(scope, receive, send)
         token = REQUEST_CREDENTIAL.set(manager)
         status = 200
+        reset_hint = None
         buffer = b""
         async def observe(message):
-            nonlocal status, buffer
+            nonlocal status, buffer, reset_hint
             if message["type"] == "http.response.start":
                 status = message["status"]
             if message["type"] == "http.response.body":
@@ -305,6 +378,12 @@ class PoolMiddleware:
                             code = err.get("code") if isinstance(err, dict) else None
                             if code in (401, 402, 403, 429):
                                 status = code
+                                if code in (402, 429):
+                                    # P1a（docs/35 §2.2）：从错误文本提取上游声明的重置时刻
+                                    text = err.get("message") or err.get("msg") or obj.get("msg")
+                                    hint = parse_retry_at(text, self.pool.clock())
+                                    if hint is not None:
+                                        reset_hint = max(reset_hint or 0, hint)
                         except (ValueError, AttributeError):
                             pass
                 if len(buffer) > 65536:
@@ -314,4 +393,4 @@ class PoolMiddleware:
             await self.app(scope, receive, observe)
         finally:
             REQUEST_CREDENTIAL.reset(token)
-            self.pool.record(aid, status)
+            self.pool.record(aid, status, retry_at=reset_hint)

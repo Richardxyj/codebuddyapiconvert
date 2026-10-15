@@ -1,13 +1,13 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><title>WorkBuddy · 管理控制台</title><link rel="stylesheet" href="/admin/assets/style.css"><script defer src="/admin/assets/app.js"></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><title>WorkBuddy · 管理控制台</title><link rel="stylesheet" href="/admin/assets/style.css"><script defer src="/admin/assets/app.js"></script><script defer src="/admin/assets/local.js"></script></head>
 <body>
 <section id="login" class="login-screen" hidden>
   <div class="login-story"><a class="brand" href="/admin/"><span class="brand-symbol">w<span>↗</span></span>WORKBUDDY <span class="brand-label">CONSOLE</span></a><div><span class="eyebrow light">YOUR MODELS, CONNECTED.</span><h1>把连接打理好。<br><em>让工作继续。</em></h1><p>在一个地方管理登录凭据、客户端密钥<br>和你的模型连接。</p></div><footer><span class="status-dot"></span> 私有部署 · 你的工作空间</footer></div>
   <div class="login-form-wrap"><form id="login-form"><span class="eyebrow">WORKSPACE ACCESS</span><h2>登录管理控制台</h2><p class="muted">使用独立管理密钥进入，客户端 API Key 不适用于此处。</p><label for="admin-key">管理密钥</label><input id="admin-key" name="key" type="password" autocomplete="current-password" placeholder="输入你的管理密钥" required><p id="login-error" class="field-error" role="alert"></p><button class="primary wide" type="submit">进入控制台 <span>↗</span></button><div class="privacy-note"><span>◇</span><p>账号凭据保存在服务器。<br>浏览器不会保存你的管理密钥。</p></div></form><span class="login-foot">WorkBuddy / CodeBuddy · API Management</span></div>
 </section>
 <div id="workspace" class="app-shell" hidden>
-  <aside class="sidebar"><a class="brand" href="/admin/"><span class="brand-symbol">w<span>↗</span></span><span>WORKBUDDY<small>管理控制台</small></span></a><div class="nav-caption">工作空间</div><nav aria-label="主要导航"><button data-page="dashboard" class="nav-item"><span>▦</span>概览</button><button data-page="accounts" class="nav-item selected"><span>◫</span>账号池</button><button data-page="keys" class="nav-item"><span>⌘</span>API 密钥</button><button data-page="test" class="nav-item"><span>↗</span>连接测试</button><button data-page="guide" class="nav-item"><span>≡</span>接入指南</button></nav><div class="sidebar-bottom"><span class="tag">PRIVATE WORKSPACE</span><p><i class="status-dot"></i> 服务已连接</p><button id="logout" class="logout">退出登录 <span>↗</span></button></div></aside>
+  <aside class="sidebar"><a class="brand" href="/admin/"><span class="brand-symbol">w<span>↗</span></span><span>WORKBUDDY<small>管理控制台</small></span></a><div class="nav-caption">工作空间</div><nav aria-label="主要导航"><button data-page="dashboard" class="nav-item"><span>▦</span>概览</button><button data-page="accounts" class="nav-item selected"><span>◫</span>账号池</button><button data-page="keys" class="nav-item"><span>⌘</span>API 密钥</button><button data-page="test" class="nav-item"><span>↗</span>连接测试</button><button data-page="guide" class="nav-item"><span>≡</span>接入指南</button><div class="nav-caption">本机</div><button data-page="local-overview" class="nav-item"><span>⌂</span>配置总览</button><button data-page="local-credentials" class="nav-item"><span>⚿</span>凭据管理</button><button data-page="local-logs" class="nav-item"><span>≣</span>日志诊断</button></nav><div class="sidebar-bottom"><span class="tag">PRIVATE WORKSPACE</span><p><i class="status-dot"></i> 服务已连接</p><button id="logout" class="logout">退出登录 <span>↗</span></button></div></aside>
   <div class="main-shell"><header class="topbar"><div><span class="muted">工作空间</span><span class="slash">/</span><span id="breadcrumb">账号管理</span></div><div class="topbar-right"><span id="host-label" class="mono"></span><span class="avatar">W</span></div></header>
   <main>
     <div class="page-title"><div><span id="page-kicker" class="eyebrow">ACCOUNT DIRECTORY</span><h1 id="page-title">账号管理<span class="title-dot">.</span></h1><p id="page-desc" class="muted">集中管理登录凭据、积分与账号可用状态。</p></div><button id="refresh" class="secondary"><span>↻</span> 刷新状态</button></div>
@@ -32,6 +32,33 @@
     <section id="page-test" class="page-panel" hidden><div class="test-layout"><form id="test-form" class="surface test-form"><span class="eyebrow">LIVE REQUEST</span><h2>发送一条真实请求</h2><p class="muted">使用当前选中的账号，测试会消耗少量上游额度。</p><div class="active-strip">当前账号 <strong id="test-account">—</strong></div><label for="model">测试模型</label><select id="model" required></select><label for="test-prompt">消息</label><textarea id="test-prompt" rows="5" maxlength="2000" required>请只回复：连接成功</textarea><button id="test-submit" class="primary wide" type="submit">发送测试 ↗</button></form><article class="surface response-surface"><div class="response-header"><h2>响应结果</h2><span id="test-status" class="pill">等待请求</span></div><pre id="test-output" class="test-output">选择模型并发送消息，结果将在这里显示。</pre><div id="test-meta" class="muted mono"></div></article></div><div class="section-toolbar"><div><h2>本次运行的测试记录</h2><p>仅记录状态与耗时，不记录测试消息或回复。</p></div></div><div id="test-history" class="history"></div></section>
     <section id="page-guide" class="page-panel" hidden><div class="guide-grid"><article class="surface"><span class="eyebrow">01 / CREDENTIALS</span><h2>添加登录凭据</h2><p>优先使用“添加账号 → 浏览器登录”，在官方页面授权后自动保存，无需桌面客户端。也可在桌面端登录后，按 Win + R 打开以下目录导入文件：</p><div class="code-block"><code>%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth</code><button data-copy="%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth" class="copy-button">复制</button></div><p>将其中的 <code>.info</code> 文件拖入“添加账号”，或粘贴其 JSON 内容。支持保留多个账号并手动切换；浏览器授权和文件导入可同时使用。</p></article><article class="surface"><span class="eyebrow">02 / CLIENTS</span><h2>连接你的客户端</h2><label>OpenAI / Responses Base URL</label><div class="code-block"><code id="base-url"></code><button id="copy-base" class="copy-button">复制</button></div><label>Anthropic Base URL</label><div class="code-block"><code id="anthropic-url"></code><button id="copy-anthropic" class="copy-button">复制</button></div><p>在“API 密钥”创建 Key 后填入客户端。模型可先使用 <code>deepseek-v4-flash</code>；列表中的其他模型是否可用取决于账号权限。</p></article></div><article class="surface endpoints"><h2>支持的接口</h2><div><span>POST</span><code>/v1/chat/completions</code><p>OpenAI Chat Completions</p></div><div><span>POST</span><code>/v1/responses</code><p>Responses 客户端</p></div><div><span>POST</span><code>/v1/messages</code><p>Anthropic Messages</p></div><div><span>GET</span><code>/v1/models</code><p>内置模型列表</p></div></article></section>
     <footer class="main-footer"><span>WORKBUDDY CONSOLE</span><span>凭据管理 · 安全连接 · 即时验证</span></footer>
+
+    <section id="page-local-overview" class="page-panel" hidden>
+      <div class="banner">本机链路只读总览：客户端密钥、Codex 配置、模型目录、端口与守护任务。数据每 30 秒自动刷新。</div>
+      <div class="section-toolbar"><div><h2>配置总览</h2><p>任一项异常会标红并给出缺失细节；修复请走守卫或手动通道，本页不提供写操作。</p></div><button id="lo-refresh" class="secondary">刷新</button></div>
+      <div id="lo-cards" class="lo-grid"><p class="history-empty">正在读取本机配置…</p></div>
+    </section>
+    <section id="page-local-credentials" class="page-panel" hidden>
+      <div class="banner">凭据通过下方"账号池"导入与启用；本页提供本机专用快捷说明与重启引导。</div>
+      <div class="section-toolbar"><div><h2>凭据管理</h2><p>更换上游 Token / 查看凭据状态 / 换后重启验证。</p></div></div>
+      <div class="lo-cred">
+        <article class="surface"><span class="eyebrow">当前上游凭据</span><div id="lc-current"><p class="history-empty">读取中…</p></div></article>
+        <article class="surface"><span class="eyebrow">更换凭据三步</span>
+          <ol class="lc-steps">
+            <li><strong>导入新凭据</strong>：到"账号池"页 → 添加账号（浏览器授权或拖入 <code>.info</code>）。</li>
+            <li><strong>启用</strong>：在账号池里把新凭据设为当前调用账号。</li>
+            <li><strong>重启验证</strong>：重启计划任务 <code>Codebuddy2Api</code> 后跑一次连接测试，确认 <code>health</code> 与模型调用正常。</li>
+          </ol>
+          <p class="muted">转换器专属明文凭据目录：<code>~/codebuddy2api/auth</code>（<code>0-</code> 前缀字典序第一）。WorkBuddy 桌面端重新登录会作废旧 session 凭据。</p>
+          <button id="lc-goto-accounts" class="primary">前往账号池 ↗</button>
+        </article>
+      </div>
+    </section>
+    <section id="page-local-logs" class="page-panel" hidden>
+      <div class="banner">converter.log 尾部只读查看：<span class="lg-err">✗ HTTP 错误</span> 与 <span class="lg-proj">PROJECTION</span> 行自动高亮。仅读取尾部，不加载整个文件。</div>
+      <div class="section-toolbar"><div><h2>日志诊断</h2><p id="ll-meta" class="muted">—</p></div><div class="ll-controls"><select id="ll-lines"><option value="60">60 行</option><option value="120" selected>120 行</option><option value="300">300 行</option><option value="600">600 行</option></select><button id="ll-refresh" class="secondary">刷新</button></div></div>
+      <pre id="ll-body" class="log-view">正在读取日志…</pre>
+    </section>
   </main></div>
 </div>
 <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><div><span class="eyebrow">ADD ACCOUNT</span><h2>添加账号</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div><p class="muted">在官方页面完成登录，授权凭据保存在你的服务器。</p>

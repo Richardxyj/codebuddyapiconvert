@@ -9,7 +9,6 @@ import json
 import sys
 
 import pytest
-
 sys.path.insert(0, ".")
 
 from core.responses_adapter import (
@@ -179,7 +178,6 @@ def test_desensitize_harness_user_and_tools():
     print("✅ test_desensitize_harness_user_and_tools")
 
 
-@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_compact_harness_messages_and_strip_tool_metadata():
     """测试：Codex 注入长提示被压缩，tool 描述可直接裁掉。"""
     body = {
@@ -217,7 +215,6 @@ def test_compact_harness_messages_and_strip_tool_metadata():
     print("✅ test_compact_harness_messages_and_strip_tool_metadata")
 
 
-@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_no_compact_still_prunes_codex_runtime_metadata():
     """测试：保留全文模式仍会裁掉 Codex 注入的运行时元数据大段文本。"""
     body = {
@@ -585,12 +582,11 @@ def test_nonstream_response():
     print("✅ test_nonstream_response")
 
 
-@pytest.mark.skipif(desensitize_body is None, reason="internal desensitize module is release-excluded")
 def test_channel_detection_terms_zwsp():
     """P-201 v2 回归（2026-09-19）：通道检测词必须被零宽脱敏。
 
-    实证链：完整 base_instructions 原文 → 后端 400 code 11128
-    （未授权调用通道提示）；通道词零宽化后 → 200（本地探针 P1/P1b）。
+    实证链：完整 base_instructions 原文 → 后端 400 code 11128（上游通道检测拦截）；
+    通道词 ZWSP 化后 → 200（探测脚本 P1/P1b）。
     若本用例挂，说明词表被回退，codex 全形态请求将再次全阻。
     """
     from core.desensitize import desensitize_text
@@ -1324,6 +1320,7 @@ import core.converter as _conv
 def _reset_official_cache():
     _conv._official_models_cache["list"] = None
     _conv._official_models_cache["ts"] = 0.0
+    _conv._official_models_cache["fail_ts"] = 0.0
 
 
 def test_extract_official_models_prefers_default_tag():
@@ -1358,13 +1355,30 @@ class _FakeResp:
         return self._payload
 
 
-def _patch_fetch(monkeypatch, payload=None, status=200, raise_exc=None, calls=None):
-    """替换 _cred 与 httpx.Client，返回可控的官方模型响应。"""
+def _patch_fetch(monkeypatch, payload=None, status=200, raise_exc=None, calls=None,
+                 v3_payload=None, v3_status=200, v3_raise_exc=None):
+    """替换 _cred 与 httpx.Client，返回可控的官方模型响应。
+
+    docs/35 P1b 起 _fetch_official_models 主源为 /v3/config（CLI 通道 UA）、
+    降级源 /v2/enterprises/personal/models，故按 URL 分发：默认从 v2 payload 的
+    default agent 自动构造同构的 v3 名册（models+agents.cli），保持既有用例
+    的语义（官方列表 == default agent models）不变。
+    """
     class _Cred:
         def get_headers(self):
             return {"Authorization": "Bearer x"}
 
     monkeypatch.setattr(_conv, "_cred", lambda: _Cred())
+
+    v3 = v3_payload
+    if v3 is None and payload is not None:
+        ids = []
+        for a in (payload.get("data") or {}).get("agents") or []:
+            if "default" in (a.get("tags") or []):
+                ids = a.get("models") or []
+        if ids:
+            v3 = {"data": {"models": [{"id": i} for i in ids],
+                           "agents": [{"name": "cli", "models": list(ids)}]}}
 
     class _Client:
         def __init__(self, timeout=0):
@@ -1381,6 +1395,10 @@ def _patch_fetch(monkeypatch, payload=None, status=200, raise_exc=None, calls=No
                 calls.append(url)
             if raise_exc is not None:
                 raise raise_exc
+            if "/v3/config" in url:
+                if v3_raise_exc is not None:
+                    raise v3_raise_exc
+                return _FakeResp(v3 or {"data": {}}, v3_status)
             return _FakeResp(payload or {"data": {"agents": []}}, status)
 
     monkeypatch.setattr(_conv.httpx, "Client", _Client)
@@ -1404,6 +1422,27 @@ def test_official_models_take_priority_over_static(monkeypatch):
         assert m in models
     _reset_official_cache()
     print("✅ test_official_models_take_priority_over_static")
+
+
+def test_resolve_model_keeps_backend_confirmed_models(monkeypatch):
+    """后端实测可用但官方动态列表未列的模型（EXTRA_MODELS）必须原样通过 resolve_model，
+    不得静默回退 MODEL_FALLBACK（R1；2026-09-24 glm-5.3-flash 事故回归锚）。"""
+    _reset_official_cache()
+    payload = {"data": {"agents": [
+        {"models": ["glm-5.2", "kimi-k3-1"], "tags": ["default"]},
+    ]}}
+    _patch_fetch(monkeypatch, payload)
+    # glm-5.3-flash 不在官方列表，但必须在 EXTRA_MODELS → 原样通过
+    assert "glm-5.3-flash" in _conv.EXTRA_MODELS
+    assert _conv.resolve_model("glm-5.3-flash") == "glm-5.3-flash"
+    assert "glm-5.3-flash" in _conv.get_available_models()
+    # deepseek-v4-flash（config profiles.fast）同理
+    assert "deepseek-v4-flash" in _conv.EXTRA_MODELS
+    assert _conv.resolve_model("deepseek-v4-flash") == "deepseek-v4-flash"
+    # 对照：真正未知的名字仍走回退
+    assert _conv.resolve_model("totally-unknown-model") == _conv.MODEL_FALLBACK
+    _reset_official_cache()
+    print("✅ test_resolve_model_keeps_backend_confirmed_models")
 
 
 def test_official_models_failure_falls_back_to_static(monkeypatch):
@@ -1457,3 +1496,146 @@ def test_official_models_ttl_cache_avoids_refetch(monkeypatch):
     assert m4 == m1
     _reset_official_cache()
     print("✅ test_official_models_ttl_cache_avoids_refetch")
+
+
+def test_models_fetch_failure_backoff(monkeypatch):
+    """对抗审计 P2-8：双源全失败后进入退避期，期间非 force 调用零上游请求。"""
+    _reset_official_cache()
+    calls = []
+    _patch_fetch(monkeypatch, payload=None, status=500, v3_status=500, calls=calls)
+    # 第一次：v3 + v2 各打一次，全败
+    assert _conv._fetch_official_models(force=True) is None
+    assert len(calls) == 2
+    # 退避期内（非 force）：直接返回缓存（None），零请求、零日志
+    calls.clear()
+    logs = []
+    monkeypatch.setattr(_conv, "_log", logs.append)
+    assert _conv._fetch_official_models() is None
+    assert calls == [] and logs == []
+    # 任一源恢复后：成功写入并清除退避
+    _patch_fetch(monkeypatch, payload={"data": {"agents": [{"models": ["glm-9"], "tags": ["default"]}]}}, calls=calls)
+    assert _conv._fetch_official_models(force=True) == ["glm-9"]
+    assert _conv._official_models_cache["fail_ts"] == 0.0
+    _reset_official_cache()
+    print("✅ test_models_fetch_failure_backoff")
+
+
+def test_extract_official_models_v3_roster():
+    """/v3/config 提取：cli 名册保序、剔非聊天 tag、缺 cli 名册视为失败。"""
+    payload = {"data": {
+        "models": [
+            {"id": "kimi-k3-2"}, {"id": "glm-5.3"}, {"id": "hy3-x"},
+            {"id": "img-model", "tags": ["text-to-image"]},
+            {"id": "codewise-noise"},
+        ],
+        "agents": [{"name": "cli", "models": ["kimi-k3-2", "glm-5.3", "img-model", "not-in-models"]}],
+    }}
+    # 名册顺序保留；img-model 被 NON_CHAT_MODEL_TAGS 过滤；not-in-models 不在 models 里被剔
+    assert _conv._extract_official_models_v3(payload) == ["kimi-k3-2", "glm-5.3"]
+    # 无 cli agent / 空 models / 非法结构 → 一律 []（走 v2 降级）
+    assert _conv._extract_official_models_v3({"data": {"models": [{"id": "a"}], "agents": []}}) == []
+    assert _conv._extract_official_models_v3({"data": {"models": [{"id": "a"}]}}) == []
+    assert _conv._extract_official_models_v3({}) == []
+    print("✅ test_extract_official_models_v3_roster")
+
+
+def test_v3_failure_falls_back_to_v2_with_log(monkeypatch):
+    """主源 /v3 失败必须降级 /v2 并留一行日志（R2 禁无日志降级）。"""
+    _reset_official_cache()
+    logs = []
+    monkeypatch.setattr(_conv, "_log", logs.append)
+    v2_payload = {"data": {"agents": [{"models": ["glm-5.2"], "tags": ["default"]}]}}
+    # 情形1：v3 HTTP 500 → v2 兜底成功
+    _patch_fetch(monkeypatch, payload=v2_payload, v3_payload={"data": {}}, v3_status=500)
+    assert _conv._fetch_official_models(force=True) == ["glm-5.2"]
+    assert any("/v3/config" in line and "回退" in line for line in logs), logs
+    # 情形2：v3 网络异常（v2 正常）→ v2 兜底成功
+    _reset_official_cache(); logs.clear()
+    _patch_fetch(monkeypatch, payload=v2_payload, v3_raise_exc=RuntimeError("boom"))
+    assert _conv._fetch_official_models(force=True) == ["glm-5.2"]
+    assert any("RuntimeError" in line and "回退" in line for line in logs), logs
+    # 情形3：v3 200 但缺 cli 名册 → 视为失败降级 v2
+    _reset_official_cache(); logs.clear()
+    _patch_fetch(monkeypatch, payload=v2_payload, v3_payload={"data": {"models": [{"id": "x"}], "agents": []}})
+    assert _conv._fetch_official_models(force=True) == ["glm-5.2"]
+    assert any("cli 名册" in line for line in logs), logs
+    _reset_official_cache()
+    print("✅ test_v3_failure_falls_back_to_v2_with_log")
+
+
+def test_v3_request_uses_cli_channel_ua(monkeypatch):
+    """主源请求必须带 CLI 通道 UA（/v3 按客户端通道返回不同名册，载荷语义关键）。"""
+    _reset_official_cache()
+    seen = []
+    class _Cred:
+        def get_headers(self):
+            return {"Authorization": "Bearer x", "User-Agent": "codebuddy2openai/2.0"}
+    monkeypatch.setattr(_conv, "_cred", lambda: _Cred())
+    class _Client:
+        def __init__(self, timeout=0): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, headers=None):
+            seen.append((url, headers.get("User-Agent")))
+            return _FakeResp({"data": {"models": [{"id": "glm-9"}], "agents": [{"name": "cli", "models": ["glm-9"]}]}}, 200)
+    monkeypatch.setattr(_conv.httpx, "Client", _Client)
+    assert _conv._fetch_official_models(force=True) == ["glm-9"]
+    assert len(seen) == 1, "v3 命中时不应再请求 v2"
+    url, ua = seen[0]
+    assert "/v3/config" in url
+    assert ua == _conv.OFFICIAL_MODELS_V3_UA and "CodeBuddy" in ua
+    _reset_official_cache()
+    print("✅ test_v3_request_uses_cli_channel_ua")
+
+
+def test_model_fallback_succession_p1b():
+    """kimi-k3-1 退役继任：fallback/别名指向 kimi-k3-2；kimi-k3-1 经 EXTRA 仍可解析（R1）。"""
+    assert _conv.MODEL_FALLBACK == "kimi-k3-2"
+    assert _conv.MODEL_ALIAS["gpt-5.6-sol"] == "kimi-k3-2"
+    assert "kimi-k3-1" in _conv.EXTRA_MODELS
+    assert _conv.resolve_model("kimi-k3-1") == "kimi-k3-1"
+    assert "auto" in _conv.EXTRA_MODELS and "minimax-m3" in _conv.EXTRA_MODELS
+    print("✅ test_model_fallback_succession_p1b")
+
+
+def test_find_auth_file_mtime_priority_and_states(monkeypatch, tmp_path):
+    """P2：mtime 优先选最新可用凭据；加密/错区/损坏文件跳过并留分级日志。"""
+    import os
+    import json as _json
+    def write_info(name, token, domain="www.codebuddy.cn", mtime=None):
+        p = tmp_path / name
+        p.write_text(_json.dumps({"auth": {"accessToken": token, "domain": domain},
+                                  "account": {}}), encoding="utf-8")
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+    monkeypatch.setenv("CODEBUDDY_AUTH_DIR", str(tmp_path))
+    base = 1790000000
+    # 新但加密（dict 信封）< 旧但可用：必须选可用的
+    write_info("a-desktop.info", {"$wbEncrypted": 1, "envelope": "x"}, mtime=base + 100)
+    ok_old = write_info("b-plugin.info", "tok-ok", mtime=base)
+    logs = []
+    monkeypatch.setattr(_conv, "_log", logs.append)
+    assert _conv.find_auth_file() == ok_old
+    assert any("a-desktop.info=encrypted" in line for line in logs), logs
+    # 最新且可用：选最新
+    ok_new = write_info("c-plugin.info", "tok-ok", mtime=base + 200)
+    assert _conv.find_auth_file() == ok_new
+    # 全部不可用（加密 + 错区 + 无 token + 损坏）→ None 且日志含分级
+    for f in tmp_path.glob("*.info"):
+        f.unlink()
+    write_info("enc.info", {"$wbEncrypted": 1}, mtime=base)
+    write_info("global.info", "tok", domain="www.workbuddy.ai", mtime=base + 1)
+    write_info("notok.info", "", mtime=base + 2)
+    (tmp_path / "corrupt.info").write_text("{not json", encoding="utf-8")
+    logs.clear()
+    assert _conv.find_auth_file() is None
+    joined = "; ".join(logs)
+    for frag in ("enc.info=encrypted", "global.info=wrong-region", "notok.info=no-token", "corrupt.info=corrupt"):
+        assert frag in joined, joined
+    # 空目录 → None 且无异常
+    for f in tmp_path.glob("*.info"):
+        f.unlink()
+    assert _conv.find_auth_file() is None
+    monkeypatch.delenv("CODEBUDDY_AUTH_DIR")
+    print("✅ test_find_auth_file_mtime_priority_and_states")

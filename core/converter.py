@@ -98,11 +98,61 @@ def auth_dirs() -> list[Path]:
     return [xdg / "CodeBuddyExtension" / "Data" / "Public" / "auth"]
 
 
+def _credential_state(path: Path) -> str:
+    """凭据文件可用性分级（docs/35 P2，对齐 dsh-connect-workbuddy 五档归因）。
+
+    返回：ok / unreadable / corrupt / no-token / encrypted / wrong-region。
+    加密判定依据 WorkBuddy 5.6.0 起 accessToken 变为
+    {"$wbEncrypted":1,"envelope":"…"} 信封（dict 而非 str）。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError:
+        return "unreadable"
+    except ValueError:
+        return "corrupt"
+    auth = data.get("auth") or {}
+    token = auth.get("accessToken")
+    if isinstance(token, dict):
+        return "encrypted"
+    if not token:
+        return "no-token"
+    domain = str(auth.get("domain") or "").lower()
+    if "workbuddy.ai" in domain or "codebuddy.ai" in domain:
+        return "wrong-region"
+    return "ok"
+
+
+def _safe_mtime(path: Path) -> float:
+    """mtime 读取竞态防护（对抗审计 P2-7）：文件在 glob 与 stat 之间被删则沉底。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def find_auth_file() -> Path | None:
+    """定位可用的本机凭据文件（docs/35 P2：mtime 优先 + 失败原因分级日志）。
+
+    旧实现字典序取第一个 .info（`0-` 前缀约定），对快照残留脆弱
+    （09-24 实证 71 连 401）。新实现：同一目录内按 mtime 取最新的
+    **可用**（明文 + CN 域）文件；不可用文件跳过并留一行分级日志（R2）。
+    """
     for d in auth_dirs():
-        if d.is_dir():
-            for f in sorted(d.glob("*.info")):
-                return f
+        if not d.is_dir():
+            continue
+        candidates = sorted(d.glob("*.info"), key=_safe_mtime, reverse=True)
+        skipped: list[str] = []
+        for p in candidates:
+            state = _credential_state(p)
+            if state == "ok":
+                if skipped:
+                    _log(f"⚠ auth 发现不可用凭据已跳过：{'; '.join(skipped)}（选用 {p.name}）")
+                return p
+            skipped.append(f"{p.name}={state}")
+        if candidates and skipped:
+            _log(f"✗ auth 目录 {d} 无可用凭据：{'; '.join(skipped)}")
     return None
 
 
@@ -372,7 +422,14 @@ def _load_models_from_workbuddy() -> list[str]:
 
 # 本地补丁（2026-09-17）：后端实际可用但 product.json 动态列表未包含的模型
 # （实测：glm-5.3 / kimi-k2.8-preview 后端可正常调用，但不在 WorkBuddy product.json 列表中）
-EXTRA_MODELS = ["glm-5.3", "kimi-k2.8-preview"]
+# 2026-09-24 补充 glm-5.3-flash / deepseek-v4-flash：#19 官方动态列表（plugin 平台）不含这两个模型，
+# 而 Codex config 顶层/`profiles.fast` 正指向它们——缺了会被 resolve_model 静默回退
+# MODEL_FALLBACK(kimi-k3-1)，违反 R1（后端实测两名均接受，2026-09-24 探针 200）。
+EXTRA_MODELS = ["glm-5.3", "glm-5.3-flash", "glm-5.3-flashx", "kimi-k2.8-preview", "deepseek-v4-flash",
+                # docs/35 P1b：/v3 cli 名册不再含 auto/kimi-k3-1/minimax-m3，
+                # 但 /v2 仍列出且上游 chat 接受——保留可解析性（R1 禁静默丢弃），
+                # 待 /v2 也下线后移除
+                "auto", "kimi-k3-1", "minimax-m3"]
 
 
 # 本地补丁 #19（2026-09-22）：动态拉取官方模型列表（对标 freeworkbuddy webbuddy/models.py）。
@@ -380,9 +437,21 @@ EXTRA_MODELS = ["glm-5.3", "kimi-k2.8-preview"]
 # 端点 /v2/enterprises/personal/models 返回该账号当下真正可用的 agent 模型集，
 # 比本机 WorkBuddy product.json（静态落盘、随安装包版本冻结）更权威、更新更快。
 OFFICIAL_MODELS_PATH = "/v2/enterprises/personal/models"
+# docs/35 P1b（2026-10-15）：主源切 /v3/config——App 自己读的同源接口，带真实
+# maxInputTokens 元数据。/v3 按客户端通道返回不同名册：必须用 CLI 通道 UA
+# （对齐 dsh-connect-workbuddy 的 CLIENT_UA，实证 200 + cli agent 名册 19 模型）；
+# WorkBuddy UA 会返回 37 模型的桌面全量（含 codewise-*/hunyuan 噪声）。
+OFFICIAL_MODELS_V3_PATH = "/v3/config"
+OFFICIAL_MODELS_V3_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 OFFICIAL_MODELS_TTL = 3600  # 秒；resolve_model() 每请求调用 get_available_models()，必须 TTL 缓存避免打爆上游
+# 双源（v3+v2）全失败后的退避窗口（对抗审计 P2-8）：故障期每个请求同步打两轮上游
+# 最坏阻塞 20s 且逐请求刷降级日志——退避期内直接返回缓存/静态，不重试
+OFFICIAL_MODELS_FAIL_TTL = 300
+# 拉取超时（对抗审计 P2-8 深化）：读超时 10s，连接超时 3s——DNS/TCP 类故障
+# （最常见的故障形态）双源最坏 6s 即断，而非 20s
+_MODELS_FETCH_TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 
-_official_models_cache: dict = {"list": None, "ts": 0.0}
+_official_models_cache: dict = {"list": None, "ts": 0.0, "fail_ts": 0.0}
 _official_models_lock = threading.Lock()
 
 
@@ -406,37 +475,95 @@ def _extract_official_models(payload: dict) -> list[str]:
     return union
 
 
+def _extract_official_models_v3(payload: dict) -> list[str]:
+    """从 /v3/config 响应提取 cli 通道模型名册（docs/35 P1b）。
+
+    结构：data.models[]（含 id/tags 等元数据）+ data.agents[]（cli agent 的
+    models 是权威名册，天然过滤 codewise-*/hunyuan 等桌面全量噪声）。
+    与 dsh-connect-workbuddy 的 selectCliModels 同构；偏离点：cli 名册缺失
+    视为失败（返回 []）而非暴露全量——我们有 /v2 降级源，宁缺勿噪。
+    """
+    data = payload.get("data") or {}
+    by_id: dict[str, dict] = {}
+    for m in data.get("models") or []:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        if set(m.get("tags") or []) & NON_CHAT_MODEL_TAGS:
+            continue
+        by_id[m["id"]] = m
+    for agent in data.get("agents") or []:
+        if agent.get("name") == "cli":
+            # 名册缺失/为空均视为失败（[]）——我们有 /v2 降级源，宁缺勿噪
+            return [i for i in (agent.get("models") or []) if i in by_id]
+    return []
+
+
 def _fetch_official_models(force: bool = False) -> list | None:
     """拉取官方模型列表（带 TTL 缓存）；失败时返回过期缓存或 None。
 
-    任何异常（网络 / 凭据缺失 / 解析失败）都静默降级，返回 None 让调用方
-    回退到静态列表——绝不影响请求路由。
+    主源 /v3/config（App 同源，CLI 通道 UA）；任何失败降级 /v2 并记日志
+    （docs/35 P1b，R2 禁无日志降级）。任何异常（网络 / 凭据缺失 / 解析失败）
+    都静默降级到缓存或静态列表——绝不影响请求路由。
+    双源全失败后进入 OFFICIAL_MODELS_FAIL_TTL 退避（对抗审计 P2-8）。
     """
     now = time.time()
     with _official_models_lock:
         cached = _official_models_cache["list"]
         fresh = cached is not None and now - _official_models_cache["ts"] < OFFICIAL_MODELS_TTL
-    if not force and fresh:
+        backing_off = now - _official_models_cache.get("fail_ts", 0.0) < OFFICIAL_MODELS_FAIL_TTL
+    if not force and (fresh or backing_off):
         return cached
     try:
         headers = _cred().get_headers()
     except Exception:
         # 未登录 / 凭据不可用：无法鉴权上游，直接走缓存或静态兜底
         return cached
+    # 主源：/v3/config（CLI 通道 UA）
+    reason = "未请求"
     try:
-        with httpx.Client(timeout=10) as client:
+        v3_headers = dict(headers)
+        v3_headers["User-Agent"] = OFFICIAL_MODELS_V3_UA
+        with httpx.Client(timeout=_MODELS_FETCH_TIMEOUT) as client:
+            resp = client.get(f"{BACKEND}{OFFICIAL_MODELS_V3_PATH}", headers=v3_headers)
+        if resp.status_code == 200:
+            models = _extract_official_models_v3(resp.json())
+            if models:
+                with _official_models_lock:
+                    _official_models_cache["list"] = models
+                    _official_models_cache["ts"] = time.time()
+                    _official_models_cache["fail_ts"] = 0.0
+                return models
+            reason = "响应缺 cli 名册"
+        else:
+            reason = f"HTTP {resp.status_code}"
+    except Exception as e:
+        reason = type(e).__name__
+    # 降级源：/v2/enterprises/personal/models（回退必留痕，R2）
+    _log(f"⚠ 模型目录主源 /v3/config 不可用（{reason}），回退 /v2{OFFICIAL_MODELS_PATH}")
+    try:
+        with httpx.Client(timeout=_MODELS_FETCH_TIMEOUT) as client:
             resp = client.get(f"{BACKEND}{OFFICIAL_MODELS_PATH}", headers=headers)
         if resp.status_code != 200:
+            _mark_models_fetch_failed()
             return cached
         models = _extract_official_models(resp.json())
         if not models:
+            _mark_models_fetch_failed()
             return cached
         with _official_models_lock:
             _official_models_cache["list"] = models
             _official_models_cache["ts"] = time.time()
+            _official_models_cache["fail_ts"] = 0.0
         return models
     except Exception:
+        _mark_models_fetch_failed()
         return cached
+
+
+def _mark_models_fetch_failed():
+    """双源全失败：记录退避起点（对抗审计 P2-8）。"""
+    with _official_models_lock:
+        _official_models_cache["fail_ts"] = time.time()
 
 
 def get_available_models() -> list[str]:
@@ -475,13 +602,14 @@ def get_available_models() -> list[str]:
 # 别名映射：选择器点到的名字 → WorkBuddy 真实模型；未知名字回退 MODEL_FALLBACK。
 # （未在映射表里的 slug 回退到默认模型，保证选择器里点任何项都不会 400）
 MODEL_ALIAS = {
-    "gpt-5.6-sol": "kimi-k3-1",            # 选择器 "5.6 Sol"
+    "gpt-5.6-sol": "kimi-k3-2",            # 选择器 "5.6 Sol"（kimi-k3-1 已从 /v3 cli 名册退役，继任 k3-2，docs/35 P1b）
     "gpt-6-astra": "glm-5.3",              # 选择器 "6 Astra"
     "gpt-5.6-terra": "kimi-k2.8-preview",  # 选择器 "5.6 Terra"
     "gpt-5.6-luna": "glm-5.2",             # 选择器 "5.6 Luna"
     "gpt-5.5": "deepseek-v4-pro",          # 选择器 "5.5"
 }
-MODEL_FALLBACK = "kimi-k3-1"
+# 回退目标必须活在主源（/v3 cli）名册里；kimi-k3-1 仍可经 EXTRA_MODELS 显式解析
+MODEL_FALLBACK = "kimi-k3-2"
 
 # 本地补丁 #5（2026-09-18）：新版 Codex runtime 在"所选思考档 == 模型目录默认档"时会
 # 省略 reasoning 参数；后端只有收到显式 effort 才输出思考文本（reasoning_content）。

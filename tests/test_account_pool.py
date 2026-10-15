@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -11,7 +12,7 @@ from fastapi import HTTPException
 
 from core import converter
 from admin.server import Store
-from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages
+from admin.pool import AccountPool, PoolMiddleware, REQUEST_CREDENTIAL, summarize_packages, parse_retry_at
 from test_admin_server import credential
 
 
@@ -116,6 +117,73 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls),1)
         self.assertGreater(self.store.data['account_status'][self.a]['cooldown_until'],self.now)
         self.assertEqual(self.pool.select()[0],self.b)
+
+    def test_parse_retry_at_absolute_relative_and_none(self):
+        from datetime import datetime as dt
+        absolute=dt(2027,1,16,0,0,0,tzinfo=timezone(timedelta(hours=8))).timestamp()
+        self.assertEqual(parse_retry_at('请求过于频繁，将在 2027-01-16 00:00:00 重置',self.now),absolute)
+        self.assertEqual(parse_retry_at('限额将在 2027/1/16 09:05:00 恢复',self.now),dt(2027,1,16,9,5,tzinfo=timezone(timedelta(hours=8))).timestamp())
+        self.assertEqual(parse_retry_at('将在 30 分钟后重置',self.now),self.now+1800)
+        self.assertEqual(parse_retry_at('2 小时后恢复',self.now),self.now+7200)
+        # 对抗审计 P1-1：相对时间同样受 7 天上限（"30天"月配额文案不得冷却整月）
+        self.assertIsNone(parse_retry_at('将在 30天 后重置',self.now))
+        self.assertIsNone(parse_retry_at('100000 天后重置',self.now))
+        # 对抗审计 P2-5：小数不得截断（"1.5小时"≠5小时）
+        self.assertIsNone(parse_retry_at('将在 1.5小时 后重置',self.now))
+        self.assertIsNone(parse_retry_at('剩余 0.5 分钟',self.now))
+        # 过去的绝对时间、超出 7 天的解析伪影、无法解析的文本都不得编造
+        self.assertIsNone(parse_retry_at('将在 2020-01-01 00:00:00 重置',self.now))
+        self.assertIsNone(parse_retry_at('将在 2027-06-01 00:00:00 重置',self.now))
+        self.assertIsNone(parse_retry_at('服务暂时不可用',self.now))
+        self.assertIsNone(parse_retry_at(None,self.now))
+
+    async def test_sse_429_reset_time_honored_over_default(self):
+        from datetime import datetime as dt
+        reset=dt(2027,1,16,9,0,0,tzinfo=timezone(timedelta(hours=8))).timestamp()
+        assert self.now < reset <= self.now+7*86400
+        async def app(scope,receive,send):
+            await send({'type':'http.response.start','status':200,'headers':[(b'content-type',b'text/event-stream')]})
+            body=('data: {"error":{"code":429,"message":"请求过于频繁，将在 2027-01-16 09:00:00 重置"}}\n\n').encode()
+            await send({'type':'http.response.body','body':body,'more_body':True})
+            await send({'type':'http.response.body','body':b''})
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app,self.pool)),base_url='http://test') as client:
+            response=await client.post('/v1/messages',headers={'Authorization':'Bearer api-test'})
+            self.assertEqual(response.status_code,200)
+        self.assertEqual(self.store.data['account_status'][self.a]['cooldown_until'],reset)
+        # 未给重置时间（老行为）：兜底 now+1800
+        self.pool.record(self.b,429)
+        self.assertEqual(self.store.data['account_status'][self.b]['cooldown_until'],self.now+1800)
+
+    def test_record_error_message_distinguishes_source(self):
+        """对抗审计 P2-6：last_error 文案必须区分上游声明 vs 默认兜底。"""
+        from datetime import datetime as dt
+        reset=dt(2027,1,16,9,0,0,tzinfo=timezone(timedelta(hours=8))).timestamp()
+        self.pool.record(self.a,429,retry_at=reset)
+        self.assertIn('上游声明',self.store.data['account_status'][self.a]['last_error'])
+        self.pool.record(self.b,429)
+        self.assertIn('默认冷却 30 分钟',self.store.data['account_status'][self.b]['last_error'])
+        self.assertNotIn('上游声明',self.store.data['account_status'][self.b]['last_error'])
+
+    async def test_pool_empty_503_logs_account_states(self):
+        import admin.pool as pool_module
+        captured=[]
+        self.store.data['accounts'][self.a]['enabled']=False
+        self.store.data['accounts'][self.b]['enabled']=False
+        original=pool_module._pool_log
+        pool_module._pool_log=captured.append
+        try:
+            async def app(scope,receive,send):
+                await send({'type':'http.response.start','status':200,'headers':[]})
+                await send({'type':'http.response.body','body':b''})
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=PoolMiddleware(app,self.pool)),base_url='http://test') as client:
+                response=await client.post('/v1/responses',headers={'Authorization':'Bearer api-test'})
+                self.assertEqual(response.status_code,503)
+        finally:
+            pool_module._pool_log=original
+        self.assertEqual(len(captured),1)
+        self.assertIn('/v1/responses',captured[0])
+        self.assertIn('账号状态',captured[0])
+        self.assertIn('paused',captured[0])
 
     def test_pagination_is_complete(self):
         def handler(req):

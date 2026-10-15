@@ -20,6 +20,7 @@ from core import converter
 from .browser_login import BrowserLogin
 from .pool import AccountPool, PoolMiddleware
 from .metrics import RequestMetrics, MetricsMiddleware
+from . import localprobe
 
 COOKIE = "workbuddy_admin"
 MAX_BODY = 1024 * 1024
@@ -303,9 +304,22 @@ def create_app(root=None, auth_dir=None, initial_key=None, admin_key=None, secur
 
     @app.get("/admin/assets/{filename}")
     async def asset(filename: str):
-        if filename not in {"app.js", "style.css"}:
+        if filename not in {"app.js", "style.css", "local.js"}:
             raise HTTPException(404)
         return FileResponse(ASSETS / filename)
+
+    # ---- 档 B「本地控制中心」只读本机端点（docs/33 §3，全部 require_admin + 只读）----
+    @app.get("/admin/api/local/overview")
+    async def local_overview(req: Request):
+        store.require_admin(req)
+        # 各子项独立判定且绝不抛出；放入线程避免 netstat/PowerShell 子进程阻塞事件循环
+        return await asyncio.to_thread(localprobe.local_overview)
+
+    @app.get("/admin/api/local/logs")
+    async def local_logs(req: Request, lines: int = 120):
+        store.require_admin(req)
+        lines = max(1, min(int(lines), 1000))
+        return await asyncio.to_thread(localprobe.read_log_tail, lines)
 
     @app.post("/admin/api/login")
     async def login(req: Request):

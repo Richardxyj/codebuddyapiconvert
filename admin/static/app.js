@@ -7,7 +7,10 @@ const labels = {
   accounts: ["账号池", "ACCOUNT POOL", "集中管理登录凭据、积分与可用状态，让请求自动分配到可用账号。"],
   keys: ["API 密钥", "CLIENT ACCESS", "为每个客户端分配独立密钥，让连接清晰可控。"],
   test: ["连接测试", "CONNECTION LAB", "从当前账号发起请求，确认模型能否正常响应。"],
-  guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"]
+  guide: ["接入指南", "GET CONNECTED", "从导入凭据到客户端接入，只需几步。"],
+  "local-overview": ["配置总览", "LOCAL CONFIG", "本机链路只读健康：密钥、配置、模型目录、端口与守护。"],
+  "local-credentials": ["凭据管理", "CREDENTIALS", "更换上游 Token、查看凭据状态与换后重启引导。"],
+  "local-logs": ["日志诊断", "LOG DIAGNOSTICS", "converter.log 尾部只读，错误与投影行自动高亮。"]
 };
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const stamp = ts => ts ? new Date(ts).toLocaleString("zh-CN", {hour12:false}) : "未提供";
@@ -37,6 +40,7 @@ function goPage(next) {
   const dot = document.createElement("span"); dot.className = "title-dot"; dot.textContent = "."; $("page-title").append(dot);
   $("breadcrumb").textContent = next === "dashboard" ? "概览" : title; $("page-kicker").textContent = kicker; $("page-desc").textContent = desc;
   history.replaceState(null, "", "#" + next);
+  if (next.startsWith("local-") && window.LocalPages) window.LocalPages.render(next);
 }
 function render() {
   const {accounts, keys, models, uptime, events} = overview;
